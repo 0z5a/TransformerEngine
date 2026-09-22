@@ -93,7 +93,15 @@ _BOOTSTRAP_SETTINGS: Optional[dict[str, object]] = None
 
 @dataclass(frozen=True, slots=True)
 class EpConfig:
-    """Immutable configuration shared by EP MoE operations."""
+    """Immutable configuration shared by EP MoE operations.
+
+    The configuration describes the routing that expert parallelism performs and
+    the format of the data it moves. It describes no particular transport: the
+    ops in ``transformer_engine.pytorch.ops.basic`` accept it whichever backend
+    carries the tokens, and a backend that needs transport settings of its own
+    (an ``EpBuffer``'s receive capacity, alignment, payload dtype, zero-copy and
+    overflow policy) is configured with them directly.
+    """
 
     top_k: int
     hidden_dim: int
@@ -105,6 +113,10 @@ class EpConfig:
     payload_dtype: torch.dtype = torch.bfloat16
     zero_copy: bool = False
     drop_on_overflow: bool = False
+    # Quantization recipes used to move the dispatched tokens forward and the
+    # combined gradient backward; ``None`` moves BF16 both ways.
+    dispatch_fwd_quant_recipe: Optional["Recipe"] = None
+    combine_bwd_quant_recipe: Optional["Recipe"] = None
 
 
 def _atexit_finalize() -> None:

@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""Fusible NCCL expert-parallel dispatch operation."""
+"""Fusible expert-parallel dispatch operation."""
 
 from __future__ import annotations
 
@@ -16,20 +16,20 @@ from ...ep import (
     _ep_dispatch_bwd,
     _ep_prepare_and_dispatch_fwd,
 )
-from ...quantization import QuantizerRole
 from ...tensor import Quantizer
 from .._common import (
     is_quantized_tensor,
     maybe_dequantize,
     validate_ep_buffer,
-    validate_ep_comms_recipe,
 )
 from ..op import BasicOperation, OperationContext
+from .moe_local import dispatch_backward, dispatch_forward, make_routing_plan
 
 
 def _validate_dispatch_input(
     input_: torch.Tensor,
-    buffer: EpBuffer,
+    hidden_dim: int,
+    device: torch.device,
 ) -> tuple[int, int]:
     """Validate the local token matrix."""
     if (
@@ -41,12 +41,13 @@ def _validate_dispatch_input(
             f"MoeDispatch input must be a plain BF16 tensor, got {type(input_).__name__}."
         )
     input_shape = tuple(input_.shape)
-    if len(input_shape) != 2 or input_shape[-1] != buffer.hidden_dim:
+    if len(input_shape) != 2 or input_shape[-1] != hidden_dim:
+        raise ValueError(f"MoeDispatch input must have shape (T, {hidden_dim}), got {input_shape}.")
+    if input_.device != device:
         raise ValueError(
-            f"MoeDispatch input must have shape (T, {buffer.hidden_dim}), got {input_shape}."
+            "MoeDispatch input and routing metadata must share a device: input is on "
+            f"{input_.device}, routing is on {device}."
         )
-    if input_.device != buffer.device:
-        raise ValueError(f"MoeDispatch input must be on {buffer.device}, got {input_.device}.")
     return input_shape
 
 
@@ -65,10 +66,17 @@ def _validate_routing_inputs(
 
 
 class MoeDispatch(BasicOperation):
-    """Quantize and dispatch BF16 tokens to local experts with NCCL EP.
+    """Route tokens to experts and distribute them across expert-parallel ranks
 
     The extra inputs are routing indices and FP32 routing weights. The extra
     outputs are local tokens-per-expert and received routing weights.
+
+    The communication backend is selected by the ``buffer`` passed to the
+    constructor: an ``EpBuffer`` dispatches with NCCL EP, and no buffer selects
+    the PyTorch backend, which requires every expert to be local (EP=1). The
+    quantization format of the communication is an EP backend detail, so the
+    backend configures it rather than this operation's quantizers.
+
     """
 
     num_extra_inputs: int = 2
@@ -85,32 +93,6 @@ class MoeDispatch(BasicOperation):
             raise NotImplementedError("MoeDispatch does not support zero-copy EP.")
         self.config = config
         self.buffer = buffer
-
-    def num_quantizers(self, mode: str) -> int:
-        # quantized dispatch_bwd is not supported.
-        return 1 if mode == "forward" else 0
-
-    def get_quantizer_roles(self, mode: str) -> Optional[list[QuantizerRole]]:
-        if mode == "forward":
-            name = getattr(self, "name", "") or ""
-            return [
-                QuantizerRole(
-                    module_type="dispatch",
-                    tensor_type="dispatch_input",
-                    name=name,
-                )
-            ]
-        return None
-
-    def pre_fuser_forward(self, *, requires_grad: bool) -> None:
-        super().pre_fuser_forward(requires_grad=requires_grad)
-        quantizer = self.get_quantizer("forward", 0)
-        if quantizer is not None:
-            # We just need data, scales for dispatch, and grouped tensor
-            # will be recreated after dispatch op.
-            quantizer.set_usage(rowwise=True, columnwise=False)
-            quantizer.optimize_for_gemm = False
-            quantizer.internal = True
 
     def op_forward(self, *args: Any, **kwargs: Any) -> None:
         raise RuntimeError("MoeDispatch uses fuser_forward")
@@ -129,16 +111,21 @@ class MoeDispatch(BasicOperation):
         basic_op_kwargs: list[dict[str, Any]],
     ) -> tuple[torch.Tensor, Iterable[Iterable[torch.Tensor]]]:
         del next_op_input_quantizer, basic_op_kwargs
-        # Dispatch uses BF16 comms without an input quantizer and MXFP8 comms with one.
-        input_quantizer = self.get_quantizer("forward", 0)
         topk_idx, topk_weights = basic_op_extra_inputs[0]
+        ctx = basic_op_ctxs[0]
+
+        if self.buffer is None:
+            # PyTorch backend: tokens stay on this rank, so dispatch only sorts
+            # them into the expert-major order that the expert MLP consumes.
+            _validate_dispatch_input(input_, self.config.hidden_dim, topk_idx.device)
+            plan = make_routing_plan(topk_idx, topk_weights, self.config)
+            recv_tokens, recv_topk_weights = dispatch_forward(input_, plan)
+            if ctx.requires_grad:
+                ctx.routing_plan = plan
+            return recv_tokens, [(plan.tokens_per_expert, recv_topk_weights)]
+
         buffer = validate_ep_buffer("MoeDispatch", self.config, self.buffer)
-        validate_ep_comms_recipe(
-            "MoeDispatch",
-            input_quantizer,
-            buffer.dispatch_fwd_quant_recipe,
-        )
-        input_shape = _validate_dispatch_input(input_, buffer)
+        input_shape = _validate_dispatch_input(input_, buffer.hidden_dim, buffer.device)
         buffer.num_local_tokens = input_shape[0]
         _validate_routing_inputs(
             topk_idx,
@@ -154,10 +141,6 @@ class MoeDispatch(BasicOperation):
             None,
         )
         tokens_per_expert = buffer.tokens_per_expert
-        # If next_op_input_quantizer is different from input_quantizer,
-        # we need to requantize the data, which is handled in grouped_linear anyway.
-        # We won't get any fusion benefit, so don't do it here.
-        ctx = basic_op_ctxs[0]
         if ctx.requires_grad:
             ctx.dispatch_state = dispatch_state
             ctx.prev_op_grad_output_quantizer = prev_op_grad_output_quantizer
@@ -189,9 +172,16 @@ class MoeDispatch(BasicOperation):
         else:
             grad_recv_weights = grad_recv_weights.to(dtype=torch.float32)
 
-        grad_input, grad_topk_weights = _ep_dispatch_bwd(
-            ctx.dispatch_state,
-            grad_output,
-            grad_recv_weights,
-        )
+        if self.buffer is None:
+            grad_input, grad_topk_weights = dispatch_backward(
+                ctx.routing_plan,
+                grad_output,
+                grad_recv_weights,
+            )
+        else:
+            grad_input, grad_topk_weights = _ep_dispatch_bwd(
+                ctx.dispatch_state,
+                grad_output,
+                grad_recv_weights,
+            )
         return grad_input, [()], [(None, grad_topk_weights)]

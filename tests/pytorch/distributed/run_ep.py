@@ -263,6 +263,8 @@ class _EpTestCase(unittest.TestCase):
         self,
         alignment=0,
         top_k=TOP_K,
+        dispatch_fwd_quant_recipe=None,
+        combine_bwd_quant_recipe=None,
     ):
         return EpConfig(
             top_k=top_k,
@@ -274,15 +276,12 @@ class _EpTestCase(unittest.TestCase):
             alignment=alignment,
             zero_copy=ZERO_COPY,
             drop_on_overflow=OVERFLOW,
+            dispatch_fwd_quant_recipe=dispatch_fwd_quant_recipe,
+            combine_bwd_quant_recipe=combine_bwd_quant_recipe,
         )
 
-    def _make_buffer_from_config(
-        self,
-        config,
-        *,
-        dispatch_fwd_quant_recipe=None,
-        combine_bwd_quant_recipe=None,
-    ):
+    def _make_buffer_from_config(self, config):
+        """Build the NCCL EP buffer that a config describes, recipes included."""
         return EpBuffer(
             top_k=config.top_k,
             max_tokens_per_rank=config.max_tokens_per_rank,
@@ -291,8 +290,8 @@ class _EpTestCase(unittest.TestCase):
             recv_capacity_per_rank=config.recv_capacity_per_rank,
             alignment=config.alignment,
             payload_dtype=config.payload_dtype,
-            dispatch_fwd_quant_recipe=dispatch_fwd_quant_recipe,
-            combine_bwd_quant_recipe=combine_bwd_quant_recipe,
+            dispatch_fwd_quant_recipe=config.dispatch_fwd_quant_recipe,
+            combine_bwd_quant_recipe=config.combine_bwd_quant_recipe,
         )
 
     def _make_buffer(
@@ -302,12 +301,13 @@ class _EpTestCase(unittest.TestCase):
         dispatch_fwd_quant_recipe=None,
         combine_bwd_quant_recipe=None,
     ):
-        config = self._make_config(alignment=alignment, top_k=top_k)
-        return self._make_buffer_from_config(
-            config,
+        config = self._make_config(
+            alignment=alignment,
+            top_k=top_k,
             dispatch_fwd_quant_recipe=dispatch_fwd_quant_recipe,
             combine_bwd_quant_recipe=combine_bwd_quant_recipe,
         )
+        return self._make_buffer_from_config(config)
 
     def _require_mxfp8_shapes(self):
         if HIDDEN_DIM % 512 != 0 or TOKENS_PER_RANK % 32 != 0:
@@ -987,14 +987,33 @@ class TestMoeEpSequential(_EpTestCase):
             original = buffer.hidden_dim
             buffer.hidden_dim += 1
             try:
-                te_ops.MoeCombine(config, buffer)(expert_out)
+                te_ops.MoeCombine(config, buffer)(expert_out, topk_idx)
             finally:
                 buffer.hidden_dim = original
 
-    @_mxfp8_align_test
-    def test_role_quantizer_requires_matching_buffer_recipe(self):
-        self._require_mxfp8_shapes()
-        config = self._make_config(alignment=128)
+        # The communication recipes are backend configuration, so a config that
+        # disagrees with the buffer about the transport format is rejected.
+        mxfp8_config = replace(
+            config,
+            dispatch_fwd_quant_recipe=MXFP8BlockScaling(),
+            combine_bwd_quant_recipe=MXFP8BlockScaling(),
+        )
+        mxfp8_buffer = self._make_buffer_from_config(mxfp8_config)
+        with self.assertRaisesRegex(ValueError, "dispatch_fwd_quant_recipe"):
+            te_ops.MoeDispatch(config, mxfp8_buffer)(tokens, topk_idx, topk_weights)
+        with self.assertRaisesRegex(ValueError, "combine_bwd_quant_recipe"):
+            te_ops.MoeCombine(config, mxfp8_buffer)(expert_out, topk_idx)
+
+    def _run_dispatch_combine_identity(self, *, mxfp8):
+        """Route, apply top-k weights, and combine back to local token order."""
+        recipe = MXFP8BlockScaling() if mxfp8 else None
+        if mxfp8:
+            self._require_mxfp8_shapes()
+        config = self._make_config(
+            alignment=128 if mxfp8 else 0,
+            dispatch_fwd_quant_recipe=recipe,
+            combine_bwd_quant_recipe=recipe,
+        )
         buffer = self._make_buffer_from_config(config)
         dispatch = te_ops.MoeDispatch(config, buffer)
         combine = te_ops.MoeCombine(config, buffer)
@@ -1002,53 +1021,21 @@ class TestMoeEpSequential(_EpTestCase):
             self.cfg.rank,
             self.cfg.ep_size,
         )
-        recipe = MXFP8BlockScaling()
-        with te.autocast(enabled=True, recipe=recipe):
-            with self.assertRaisesRegex(ValueError, "does not have an MXFP8BlockScaling recipe"):
-                dispatch(tokens, topk_idx, topk_weights)
-            expert_out = torch.empty(
-                self.cfg.recv_capacity_per_rank,
-                HIDDEN_DIM,
-                dtype=torch.bfloat16,
-                device=self.cfg.device,
-                requires_grad=True,
-            )
-            with self.assertRaisesRegex(ValueError, "does not have an MXFP8BlockScaling recipe"):
-                combine(expert_out)
-
-    def _run_dispatch_combine_identity(self, *, mxfp8):
-        """Route, apply top-k weights, and combine back to local token order."""
+        recv_tokens, tokens_per_expert, recv_weights = dispatch(
+            tokens,
+            topk_idx,
+            topk_weights,
+        )
         if mxfp8:
-            self._require_mxfp8_shapes()
-        recipe = MXFP8BlockScaling() if mxfp8 else None
-        config = self._make_config(alignment=128 if mxfp8 else 0)
-        buffer = self._make_buffer_from_config(
-            config,
-            dispatch_fwd_quant_recipe=recipe,
-            combine_bwd_quant_recipe=recipe,
+            # Convert to BF16 since combine only supports BF16 in NCCL EP
+            # for now. dequantizing to mxfp8 below changes its overall shape
+            # to sum(tokens_per_expert).
+            recv_tokens = _degroup_mxfp8(recv_tokens)
+            recv_weights = recv_weights[: recv_tokens.shape[0]]
+        weighted_expert_output = (recv_tokens.float() * recv_weights.float().unsqueeze(-1)).to(
+            torch.bfloat16
         )
-        dispatch = te_ops.MoeDispatch(config, buffer)
-        combine = te_ops.MoeCombine(config, buffer)
-        topk_idx, tokens, topk_weights = _make_identity_inputs(
-            self.cfg.rank,
-            self.cfg.ep_size,
-        )
-        with te.autocast(enabled=mxfp8, recipe=recipe):
-            recv_tokens, tokens_per_expert, recv_weights = dispatch(
-                tokens,
-                topk_idx,
-                topk_weights,
-            )
-            if mxfp8:
-                # Convert to BF16 since combine only supports BF16 in NCCL EP
-                # for now. dequantizing to mxfp8 below changes its overall shape
-                # to sum(tokens_per_expert).
-                recv_tokens = _degroup_mxfp8(recv_tokens)
-                recv_weights = recv_weights[: recv_tokens.shape[0]]
-            weighted_expert_output = (recv_tokens.float() * recv_weights.float().unsqueeze(-1)).to(
-                torch.bfloat16
-            )
-            output = combine(weighted_expert_output)
+        output = combine(weighted_expert_output, topk_idx)
         torch.cuda.synchronize()
         torch.testing.assert_close(output, tokens, atol=5e-2, rtol=5e-2)
         self.assertEqual(tokens_per_expert.data_ptr(), buffer.tokens_per_expert.data_ptr())
@@ -1073,12 +1060,12 @@ class TestMoeEpSequential(_EpTestCase):
         glu_interleave_size=None,
     ):
         """Build the exact five-op sequence recognized by MegaMoE fusion."""
-        config = self._make_config(alignment=128 if recipe is not None else 0)
-        buffer = self._make_buffer_from_config(
-            config,
+        config = self._make_config(
+            alignment=128 if recipe is not None else 0,
             dispatch_fwd_quant_recipe=recipe,
             combine_bwd_quant_recipe=recipe,
         )
+        buffer = self._make_buffer_from_config(config)
         dispatch = te_ops.MoeDispatch(config, buffer)
         init_ctx = (
             te.quantized_model_init(enabled=True, recipe=recipe)
@@ -1194,6 +1181,7 @@ class TestMoeEpSequential(_EpTestCase):
                 static_tokens,
                 static_topk_idx,
                 static_topk_weights,
+                static_topk_idx,
             )
         graph_out_snapshot = graph_out.detach().clone()
         graph_out.backward(static_dy)
@@ -1214,6 +1202,7 @@ class TestMoeEpSequential(_EpTestCase):
                 eager_tokens,
                 static_topk_idx,
                 eager_topk_weights,
+                static_topk_idx,
             )
         tolerances = {"rtol": 0.125, "atol": 0.25}
         torch.testing.assert_close(graph_out_snapshot, eager_out, **tolerances)
@@ -1365,6 +1354,7 @@ class TestMoeEpSequential(_EpTestCase):
                 seq_tokens,
                 topk_idx,
                 seq_topk_weights,
+                topk_idx,
             )
 
         self.assertEqual(seq_out.dtype, torch.bfloat16)
